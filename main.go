@@ -7,6 +7,10 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/certificate-transparency-go/client"
@@ -41,35 +45,60 @@ func main() {
 		log.Fatalf("Failed to get log list: %v", err)
 	}
 
-	var selectedLogInfo LogInfo
-	foundLog := false
-
-	// Iterate through operators and their logs to find the first available log
+	var googleLogs []LogInfo
+	foundOperator := false
 	for _, operator := range logList.Operators {
-		if len(operator.Logs) > 0 {
-			selectedLogInfo = operator.Logs[0]
-			foundLog = true
+		if operator.Name == "Google" {
+			googleLogs = operator.Logs
+			foundOperator = true
 			break
 		}
 	}
 
-	if !foundLog {
-		log.Fatal("No logs found in the log list.")
+	if !foundOperator {
+		log.Fatal("Google operator not found in the log list.")
 	}
 
+	if len(googleLogs) == 0 {
+		log.Fatal("No logs found for the Google operator.")
+	}
+
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+
+	for _, logInfo := range googleLogs {
+		wg.Add(1)
+		go monitorLog(logInfo, &wg, done)
+	}
+
+	// Wait for a signal to gracefully shut down
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt)
+	<-sigChan
+
+	log.Println("Shutting down...")
+	close(done)
+	wg.Wait()
+	log.Println("All monitors stopped.")
+}
+
+func monitorLog(logInfo LogInfo, wg *sync.WaitGroup, done <-chan struct{}) {
+	defer wg.Done()
 	// Create a new CT client
-	logClient, err := client.New(selectedLogInfo.URL, http.DefaultClient, jsonclient.Options{})
+	logClient, err := client.New(logInfo.URL, http.DefaultClient, jsonclient.Options{})
 	if err != nil {
-		log.Fatalf("Failed to create CT client: %v", err)
+		log.Printf("Failed to create CT client for %s: %v", logInfo.Description, err)
+		return
 	}
 
 	// Get the initial STH (Signed Tree Head)
 	sth, err := logClient.GetSTH(context.Background())
 	if err != nil {
-		log.Fatalf("Failed to get initial STH: %v", err)
+		log.Printf("Failed to get initial STH for %s: %v", logInfo.Description, err)
+		return
 	}
 
-	log.Printf("Monitoring log: %s", selectedLogInfo.Description)
+	log.Printf("Monitoring log: %s", logInfo.Description)
 	log.Printf("Initial tree size: %d", sth.TreeSize)
 
 	ticker := time.NewTicker(10 * time.Second)
@@ -83,7 +112,7 @@ func main() {
 			// Fetch the current STH to get the most up-to-date tree size.
 			currentSTH, err := logClient.GetSTH(context.Background())
 			if err != nil {
-				log.Printf("Failed to get current STH: %v", err)
+				log.Printf("Failed to get current STH for %s: %v", logInfo.Description, err)
 				continue
 			}
 
@@ -95,44 +124,55 @@ func main() {
 			// Fetch entries from nextIndex up to the current tree size.
 			entries, err := logClient.GetEntries(context.Background(), nextIndex, int64(currentSTH.TreeSize))
 			if err != nil {
-				log.Printf("Failed to get entries: %v", err)
+				log.Printf("Failed to get entries for %s: %v", logInfo.Description, err)
 				continue
 			}
 
-			            for _, entry := range entries {
-			                nextIndex++
-			                if entry.X509Cert != nil { // Outer check for X509Cert
-			                    // Parse certificate only once if it's an X509Cert entry
-			                    cert, err := x509.ParseCertificate(entry.X509Cert.Raw)
-			                    if err != nil {
-			                        log.Printf("Failed to parse X509 certificate: %v", err)
-			                        continue
-			                    }
-			
-			                    // The timestamp is actually in the MerkleTreeLeaf, which is part of the LogEntry.
-			                    // For X509Cert entries, the timestamp is typically the notBefore date of the certificate
-			                    // or the timestamp from the SignedCertificateTransparency.
-			                    // However, the original request was to get the timestamp from the log entry itself.
-			                    // Assuming entry.Leaf.TimestampedEntry is still the source for the CT log timestamp.
-			                    if entry.Leaf.TimestampedEntry != nil { // Inner check for timestamp
-			                        timestamp := time.Unix(0, int64(entry.Leaf.TimestampedEntry.Timestamp)*int64(time.Millisecond))
-			                        fmt.Printf("Timestamp: %s, Issuer: %s, Subject: %s\n",
-			                            timestamp.Format(time.RFC3339),
-			                            cert.Issuer.String(),
-			                            cert.Subject.String(),
-			                        )
-			                    } else {
-			                        log.Printf("Skipping X509Cert entry %d: TimestampedEntry is nil", nextIndex-1)
-			                    }
-			                } else if entry.Precert != nil { // Handle pre-certificates
-			                    log.Printf("Skipping precertificate entry %d", nextIndex-1)
-			                } else { // Handle other unknown entry types
-			                    log.Printf("Skipping unknown entry type %d", nextIndex-1)
-			                }
-			            }
-			        } // Closes the select statement
-			    } // Closes the for loop
-			} // Closes the main function
+			for _, entry := range entries {
+				nextIndex++
+				if entry.X509Cert != nil { // Outer check for X509Cert
+					// Parse certificate only once if it's an X509Cert entry
+					cert, err := x509.ParseCertificate(entry.X509Cert.Raw)
+					if err != nil {
+						log.Printf("Failed to parse X509 certificate from %s: %v", logInfo.Description, err)
+						continue
+					}
+
+					// The timestamp is actually in the MerkleTreeLeaf, which is part of the LogEntry.
+					// For X509Cert entries, the timestamp is typically the notBefore date of the certificate
+					// or the timestamp from the SignedCertificateTransparency.
+					// However, the original request was to get the timestamp from the log entry itself.
+					// Assuming entry.Leaf.TimestampedEntry is still the source for the CT log timestamp.
+					if entry.Leaf.TimestampedEntry != nil { // Inner check for timestamp
+						timestamp := time.Unix(0, int64(entry.Leaf.TimestampedEntry.Timestamp)*int64(time.Millisecond))
+						var names string
+						if len(cert.DNSNames) > 0 {
+							names = strings.Join(cert.DNSNames, ", ")
+						} else {
+							names = cert.Subject.CommonName
+						}
+						fmt.Printf("Timestamp: %s, Issuer: %s, Names: %s\n",
+							timestamp.Format(time.RFC3339),
+							cert.Issuer.String(),
+							names,
+						)
+					} else {
+						log.Printf("Skipping X509Cert entry %d from %s: TimestampedEntry is nil", nextIndex-1, logInfo.Description)
+					}
+				} else if entry.Precert != nil { // Handle pre-certificates
+					// Precertificates are skipped
+				} else { // Handle other unknown entry types
+					log.Printf("Skipping unknown entry type %d from %s", nextIndex-1, logInfo.Description)
+				}
+			}
+		case <-done:
+			log.Printf("Stopping monitor for %s", logInfo.Description)
+			return
+		}
+	}
+}
+
+
 // getLogList fetches and parses the log list from the given URL.
 func getLogList(url string) (*LogList, error) { // Use local LogList struct
 	resp, err := http.Get(url)
