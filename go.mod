@@ -1,4 +1,4 @@
-module certtail
+module github.com/artooro/certtail
 
 go 1.25.5
 
